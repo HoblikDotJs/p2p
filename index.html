@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pure P2P WebRTC — URL handshake (STUN only)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, system-ui, sans-serif; margin: 18px; max-width:900px; }
+    textarea { width:100%; height:90px; font-family: monospace; }
+    .row { display:flex; gap:12px; margin-bottom:12px; }
+    .col { flex:1; }
+    button { padding:8px 12px; }
+    .log { background:#111; color:#eee; padding:10px; height:160px; overflow:auto; font-family:monospace; }
+    small { color:#666; }
+    .connected { color:green; font-weight:bold; }
+  </style>
+</head>
+<body>
+  <h1>Pure P2P WebRTC (STUN) — Handshake via URL params</h1>
+  <p><small>
+    No signaling server. Use the URL to share SDP. Steps:
+    1) Click <b>Generate offer URL</b>, copy it and open on remote machine.
+    2) Remote machine auto-creates an answer URL — copy that back.
+    3) Paste answer URL into the originator's "Paste answer URL" input and press <b>Apply answer</b>.
+    When connected you'll see status and can send text or files.
+  </small></p>
+
+  <div class="row">
+    <div class="col">
+      <div><b>Your local role</b></div>
+      <button id="makeOffer">Generate offer URL (create offer & ICE)</button>
+      <button id="applyAnswer">Apply answer from URL (paste answer URL param)</button>
+    </div>
+    <div class="col">
+      <div><b>Auto-parse incoming URL</b></div>
+      <div><small>Open this page with <code>?offer=...</code> or <code>?answer=...</code> to auto-process.</small></div>
+    </div>
+  </div>
+
+  <h3>Offer URL (share to remote)</h3>
+  <textarea id="offerURL" readonly placeholder="Offer URL will appear here..."></textarea>
+
+  <h3>Answer URL (send back to originator)</h3>
+  <textarea id="answerURL" readonly placeholder="Answer URL will appear here..."></textarea>
+
+  <h3>Paste answer URL here (originator)</h3>
+  <textarea id="pasteAnswer" placeholder="Paste the URL you got from remote (the one containing &answer=...)"></textarea>
+  <div style="margin-top:8px;">
+    <button id="applyPasteAnswer">Apply pasted answer URL</button>
+  </div>
+
+  <h3>Data channel</h3>
+  <div class="row">
+    <input id="messageInput" placeholder="Type message..." />
+    <button id="sendMsg">Send</button>
+  </div>
+  <div class="row">
+    <input type="file" id="fileInput"/>
+    <button id="sendFile">Send file</button>
+  </div>
+
+  <h3>Status</h3>
+  <div id="status">idle</div>
+  <div class="log" id="log"></div>
+
+<script>
+/*
+  Pure P2P WebRTC using STUN only. No server required.
+  - Exchanges SDP via URL params: ?offer=<base64URL> or ?answer=<base64URL>
+  - Waits for ICE gathering to complete before writing SDP into URL.
+  - Uses data channel 'p2p-data' for messages and a simple file chunker.
+*/
+
+const logEl = document.getElementById('log');
+function log(...args) { console.log(...args); logEl.innerText += args.join(' ') + '\\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+const iceServers = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  // Add more STUNs if you want
+];
+
+let pc = null;
+let dataChannel = null;
+let isInitiator = false;
+
+// helpers for base64 <-> unicode-safe
+function utoa(str){ return btoa(unescape(encodeURIComponent(str))); }
+function atou(b64){ return decodeURIComponent(escape(atob(b64))); }
+
+// parse params
+function getParam(name) {
+  const params = new URLSearchParams(window.location.search);
+  return params.get(name);
+}
+function setParamInURL(name, value) {
+  const u = new URL(window.location.href);
+  u.searchParams.set(name, value);
+  // remove other param if exists
+  // update the textarea, but DO NOT navigate automatically (user might want to copy)
+  return u.toString();
+}
+
+// Wait until ICE gathering is complete
+function waitForIceGatheringComplete(pc) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    function check() {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+    }
+    pc.addEventListener('icegatheringstatechange', check);
+    // also fallback: when onicecandidate with null candidate
+    pc.addEventListener('icecandidate', (e) => {
+      if (!e.candidate) {
+        resolve();
+      }
+    });
+  });
+}
+
+function makePeerConnection() {
+  pc = new RTCPeerConnection({ iceServers });
+  pc.addEventListener('iceconnectionstatechange', () => {
+    log('ICE state:', pc.iceConnectionState);
+    document.getElementById('status').innerText = pc.iceConnectionState;
+    if (pc.iceConnectionState === 'connected') {
+      document.getElementById('status').className = 'connected';
+    }
+  });
+  pc.addEventListener('connectionstatechange', () => {
+    log('Conn state:', pc.connectionState);
+  });
+  pc.addEventListener('datachannel', (ev) => {
+    log('Incoming datachannel', ev.channel.label);
+    setupDataChannel(ev.channel);
+  });
+  return pc;
+}
+
+function setupDataChannel(ch) {
+  dataChannel = ch;
+  dataChannel.onopen = () => log('[data] open');
+  dataChannel.onclose = () => log('[data] closed');
+  dataChannel.onerror = (e) => log('[data] error', e);
+  dataChannel.onmessage = (ev) => onDataMessage(ev.data);
+}
+
+// Simple protocol: if message is JSON with type:'file-chunk' we handle file reassembly
+let incomingFiles = {}; // id -> {name, size, received, chunks: []}
+function onDataMessage(data) {
+  // binary or text
+  if (typeof data === 'string') {
+    try {
+      const obj = JSON.parse(data);
+      if (obj.type === 'file-meta') {
+        incomingFiles[obj.id] = { name: obj.name, size: obj.size, received: 0, chunks: [] };
+        log('[file] incoming', obj.name, 'size', obj.size, 'id', obj.id);
+        return;
+      } else if (obj.type === 'file-complete') {
+        const f = incomingFiles[obj.id];
+        if (!f) { log('[file] unknown complete id', obj.id); return; }
+        const blob = new Blob(f.chunks);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = f.name;
+        // auto-trigger download
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+        log('[file] received complete', f.name);
+        delete incomingFiles[obj.id];
+        return;
+        }
+    } catch(e) {
+      // not JSON; fall through
+    }
+    log('[msg] text:', data);
+    return;
+  } else { // ArrayBuffer / Blob
+    // Try ArrayBuffer
+    const arr = data instanceof Blob ? null : data;
+    if (data instanceof Blob) {
+      data.arrayBuffer().then(buf => handleChunk(buf));
+    } else {
+      handleChunk(arr);
+    }
+  }
+
+  function handleChunk(buf) {
+    // Expect first bytes to contain ID length and ID? Simpler: sender will send pure binary chunk and we can't identify which file without protocol.
+    // So we send metadata messages (file-meta) before binary chunks. We'll push chunks to the last active incoming file.
+    // Find the only file in incomingFiles which is not complete
+    const keys = Object.keys(incomingFiles);
+    if (keys.length === 0) {
+      log('[file] got a binary chunk but no metadata known');
+      return;
+    }
+    const id = keys[0]; // simple heuristic
+    const f = incomingFiles[id];
+    f.chunks.push(new Uint8Array(buf));
+    f.received += buf.byteLength;
+    log(`[file] chunk received (${buf.byteLength} bytes). total ${f.received}/${f.size}`);
+  }
+}
+
+async function createOfferAndURL() {
+  isInitiator = true;
+  makePeerConnection();
+  // create data channel
+  const ch = pc.createDataChannel('p2p-data');
+  setupDataChannel(ch);
+
+  log('Creating offer...');
+  const offer = await pc.createOffer({ offerToReceiveAudio:false, offerToReceiveVideo:false });
+  await pc.setLocalDescription(offer);
+
+  // wait for ICE gather complete
+  log('Waiting for ICE gathering to complete...');
+  await waitForIceGatheringComplete(pc);
+  log('ICE gather complete.');
+
+  // Now localDescription contains ICE candidates
+  const sdp = pc.localDescription.sdp;
+  const payload = utoa(JSON.stringify({ type: 'offer', sdp }));
+  const url = setParamInURL('offer', payload);
+  document.getElementById('offerURL').value = url;
+  log('Offer URL ready. Share it with remote.');
+}
+
+async function processIncomingOffer(base64) {
+  try {
+    const decoded = JSON.parse(atou(base64));
+    if (decoded.type !== 'offer') throw new Error('Not an offer');
+    makePeerConnection();
+
+    // Create answer path: set remote desc and create answer
+    log('Setting remote description (offer)...');
+    await pc.setRemoteDescription({ type: 'offer', sdp: decoded.sdp });
+
+    log('Creating answer...');
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    log('Waiting for ICE gather complete (answer side)...');
+    await waitForIceGatheringComplete(pc);
+    log('ICE gather complete (answer).');
+
+    // Build answer URL to send back
+    const payload = utoa(JSON.stringify({ type:'answer', sdp: pc.localDescription.sdp }));
+    const url = setParamInURL('answer', payload);
+    document.getElementById('answerURL').value = url;
+    log('Answer URL created. Copy it back to originator.');
+  } catch (e) {
+    log('Error processing offer:', e);
+  }
+}
+
+async function applyAnswerFromBase64(base64) {
+  try {
+    const decoded = JSON.parse(atou(base64));
+    if (decoded.type !== 'answer') throw new Error('Not an answer');
+    if (!pc) {
+      log('No RTCPeerConnection exists. Creating one (caller)...');
+      makePeerConnection();
+    }
+    log('Applying remote answer...');
+    await pc.setRemoteDescription({ type: 'answer', sdp: decoded.sdp });
+    log('Remote answer applied. Waiting for connection...');
+  } catch (e) {
+    log('Error applying answer:', e);
+  }
+}
+
+// UI wiring
+document.getElementById('makeOffer').addEventListener('click', async () => {
+  document.getElementById('offerURL').value = '';
+  await createOfferAndURL();
+});
+
+document.getElementById('applyAnswer').addEventListener('click', async () => {
+  const pasted = document.getElementById('pasteAnswer').value.trim();
+  if (!pasted) { alert('Paste the answer URL (the full URL with ?answer=...)'); return; }
+  // extract answer param from pasted URL
+  try {
+    const u = new URL(pasted);
+    const ans = u.searchParams.get('answer');
+    if (!ans) { alert('No answer param found in the pasted URL'); return; }
+    await applyAnswerFromBase64(ans);
+  } catch (e) {
+    alert('Invalid URL');
+  }
+});
+
+document.getElementById('applyPasteAnswer').addEventListener('click', async () => {
+  const pasted = document.getElementById('pasteAnswer').value.trim();
+  if (!pasted) { alert('Paste the answer URL (the full URL with ?answer=...)'); return; }
+  try {
+    const u = new URL(pasted);
+    const ans = u.searchParams.get('answer');
+    if (!ans) { alert('No answer param found'); return; }
+    await applyAnswerFromBase64(ans);
+  } catch (e) {
+    alert('Invalid URL');
+  }
+});
+
+document.getElementById('sendMsg').addEventListener('click', () => {
+  const txt = document.getElementById('messageInput').value;
+  if (!dataChannel || dataChannel.readyState !== 'open') return alert('Data channel not open');
+  dataChannel.send(txt);
+  log('[you] ' + txt);
+  document.getElementById('messageInput').value = '';
+});
+
+// Simple file send: metadata JSON then binary chunks (64KB)
+document.getElementById('sendFile').addEventListener('click', async () => {
+  const fi = document.getElementById('fileInput');
+  if (!fi.files || fi.files.length === 0) return alert('Select a file first');
+  if (!dataChannel || dataChannel.readyState !== 'open') return alert('Data channel not open');
+  const file = fi.files[0];
+  const id = Math.random().toString(36).slice(2);
+  // send metadata
+  dataChannel.send(JSON.stringify({ type:'file-meta', id, name:file.name, size:file.size }));
+  const chunkSize = 64*1024; // 64KB
+  const stream = file.stream();
+  const reader = stream.getReader();
+  let sent = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    // value is Uint8Array chunk
+    dataChannel.send(value);
+    sent += value.byteLength;
+    log(`[file] sent chunk ${sent}/${file.size}`);
+  }
+  dataChannel.send(JSON.stringify({ type:'file-complete', id }));
+  log('[file] send complete');
+});
+
+
+// When loaded, auto-check URL params
+(async function autoProcessURL() {
+  const offerParam = getParam('offer');
+  const answerParam = getParam('answer');
+
+  if (offerParam && !answerParam) {
+    // remote gave us an offer; create answer and show answer URL
+    log('Found offer param in URL — creating answer.');
+    await processIncomingOffer(offerParam);
+  } else if (answerParam && !offerParam) {
+    // originator: they got an answer back (maybe pasted link) — but typically they will paste.
+    // If user opened originator page with ?answer=..., apply it automatically.
+    log('Found answer param in URL — applying answer.');
+    await applyAnswerFromBase64(answerParam);
+  } else if (offerParam && answerParam) {
+    // Both present — try applying answer if we already created local offer
+    log('Found both offer and answer in URL. Attempt to apply answer.');
+    await processIncomingOffer(offerParam); // will make PC and put answerURL field, but we already have answer; so try apply
+    await applyAnswerFromBase64(answerParam);
+  } else {
+    log('No offer/answer params in URL. Create an offer to start.');
+  }
+})();
+
+</script>
+</body>
+</html>
