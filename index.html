@@ -2,371 +2,375 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Pure P2P WebRTC — URL handshake (STUN only)</title>
+  <title>PeerJS — URL Auto-Connect File Transfer</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     body { font-family: Inter, system-ui, sans-serif; margin: 18px; max-width:900px; }
-    textarea { width:100%; height:90px; font-family: monospace; }
-    .row { display:flex; gap:12px; margin-bottom:12px; }
+    .row { display:flex; gap:12px; margin-bottom:12px; align-items:center; }
     .col { flex:1; }
     button { padding:8px 12px; }
-    .log { background:#111; color:#eee; padding:10px; height:160px; overflow:auto; font-family:monospace; }
-    small { color:#666; }
+    .log { background:#111; color:#eee; padding:10px; height:200px; overflow:auto; font-family:monospace; white-space:pre-wrap; }
+    .idbox { font-family: monospace; background:#f4f4f4; padding:6px; border-radius:4px; display:inline-block; }
+    progress { width:100%; height:14px; }
+    .small { font-size:0.9rem; color:#666; }
     .connected { color:green; font-weight:bold; }
+    #dropzone { border:2px dashed #ccc; padding:12px; border-radius:6px; text-align:center; color:#666; }
   </style>
 </head>
 <body>
-  <h1>Pure P2P WebRTC (STUN) — Handshake via URL params</h1>
-  <p><small>
-    No signaling server. Use the URL to share SDP. Steps:
-    1) Click <b>Generate offer URL</b>, copy it and open on remote machine.
-    2) Remote machine auto-creates an answer URL — copy that back.
-    3) Paste answer URL into the originator's "Paste answer URL" input and press <b>Apply answer</b>.
-    When connected you'll see status and can send text or files.
-  </small></p>
+  <h1>PeerJS — Auto-URL File Transfer</h1>
+  <p class="small">Open the page, copy the <b>Share link</b> and send it to the receiver. When they open it, they'll connect automatically and can receive files.</p>
 
   <div class="row">
     <div class="col">
-      <div><b>Your local role</b></div>
-      <button id="makeOffer">Generate offer URL (create offer & ICE)</button>
-      <button id="applyAnswer">Apply answer from URL (paste answer URL param)</button>
+      <div><b>My Peer ID</b> <span id="myId" class="idbox">...</span></div>
+      <div style="margin-top:8px;">
+        <button id="copyLinkBtn">Copy share link</button>
+        <button id="regenBtn">Regenerate ID</button>
+      </div>
     </div>
     <div class="col">
-      <div><b>Auto-parse incoming URL</b></div>
-      <div><small>Open this page with <code>?offer=...</code> or <code>?answer=...</code> to auto-process.</small></div>
+      <div><b>Share link</b></div>
+      <div style="margin-top:6px;"><a id="shareLink" href="#" target="_blank">—</a></div>
     </div>
   </div>
 
-  <h3>Offer URL (share to remote)</h3>
-  <textarea id="offerURL" readonly placeholder="Offer URL will appear here..."></textarea>
-
-  <h3>Answer URL (send back to originator)</h3>
-  <textarea id="answerURL" readonly placeholder="Answer URL will appear here..."></textarea>
-
-  <h3>Paste answer URL here (originator)</h3>
-  <textarea id="pasteAnswer" placeholder="Paste the URL you got from remote (the one containing &answer=...)"></textarea>
-  <div style="margin-top:8px;">
-    <button id="applyPasteAnswer">Apply pasted answer URL</button>
-  </div>
-
-  <h3>Data channel</h3>
+  <h3>Send file</h3>
   <div class="row">
-    <input id="messageInput" placeholder="Type message..." />
-    <button id="sendMsg">Send</button>
+    <input type="file" id="fileInput" />
+    <button id="sendBtn">Send file</button>
   </div>
-  <div class="row">
-    <input type="file" id="fileInput"/>
-    <button id="sendFile">Send file</button>
+  <div id="sendProgressWrap" style="display:none; margin-top:8px;">
+    <div class="small">Send progress</div>
+    <progress id="sendProgress" max="1" value="0"></progress>
+    <div id="sendProgressText" class="small"></div>
   </div>
 
-  <h3>Status</h3>
-  <div id="status">idle</div>
+  <h3>Incoming files</h3>
+  <div id="incomingList"></div>
+
+  <h3>Status / Log</h3>
+  <div id="status">starting...</div>
   <div class="log" id="log"></div>
 
-<script>
-/*
-  Pure P2P WebRTC using STUN only. No server required.
-  - Exchanges SDP via URL params: ?offer=<base64URL> or ?answer=<base64URL>
-  - Waits for ICE gathering to complete before writing SDP into URL.
-  - Uses data channel 'p2p-data' for messages and a simple file chunker.
-*/
+  <!-- PeerJS -->
+  <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+  <script>
+  // --- Utilities & UI ---
+  const logEl = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+  function log(...args) {
+    const div = document.createElement('div');
+    div.textContent = args.join(' ');
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(...args);
+  }
 
-const logEl = document.getElementById('log');
-function log(...args) { console.log(...args); logEl.innerText += args.join(' ') + '\\n'; logEl.scrollTop = logEl.scrollHeight; }
+  const myIdEl = document.getElementById('myId');
+  const shareLinkEl = document.getElementById('shareLink');
+  const copyLinkBtn = document.getElementById('copyLinkBtn');
+  const regenBtn = document.getElementById('regenBtn');
+  const fileInput = document.getElementById('fileInput');
+  const sendBtn = document.getElementById('sendBtn');
+  const sendProgressWrap = document.getElementById('sendProgressWrap');
+  const sendProgress = document.getElementById('sendProgress');
+  const sendProgressText = document.getElementById('sendProgressText');
+  const incomingList = document.getElementById('incomingList');
 
-const iceServers = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  // Add more STUNs if you want
-];
+  // chunk size (safe for browsers)
+  const CHUNK_SIZE = 64 * 1024; // 64KB
 
-let pc = null;
-let dataChannel = null;
-let isInitiator = false;
+  let peer = null;
+  let conn = null; // PeerJS DataConnection (one connection at a time)
+  let incomingFiles = {}; // id -> {name,size,received,chunks,progressEl}
 
-// helpers for base64 <-> unicode-safe
-function utoa(str){ return btoa(unescape(encodeURIComponent(str))); }
-function atou(b64){ return decodeURIComponent(escape(atob(b64))); }
+  // parse ?id param (target id that this client should connect to)
+  const url = new URL(window.location.href);
+  const targetIdFromUrl = url.searchParams.get('id');
 
-// parse params
-function getParam(name) {
-  const params = new URLSearchParams(window.location.search);
-  return params.get(name);
-}
-function setParamInURL(name, value) {
-  const u = new URL(window.location.href);
-  u.searchParams.set(name, value);
-  // remove other param if exists
-  // update the textarea, but DO NOT navigate automatically (user might want to copy)
-  return u.toString();
-}
-
-// Wait until ICE gathering is complete
-function waitForIceGatheringComplete(pc) {
-  return new Promise((resolve) => {
-    if (pc.iceGatheringState === 'complete') return resolve();
-    function check() {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', check);
-        resolve();
-      }
+  // Start or (re)create peer
+  function startPeer(optionalId) {
+    if (peer) {
+      try { peer.destroy(); } catch(e) { console.warn('destroy previous peer', e); }
+      peer = null;
+      conn = null;
+      document.getElementById('status').innerText = 'restarting...';
     }
-    pc.addEventListener('icegatheringstatechange', check);
-    // also fallback: when onicecandidate with null candidate
-    pc.addEventListener('icecandidate', (e) => {
-      if (!e.candidate) {
-        resolve();
+
+    // Create a new random Peer ID unless optionalId provided
+    peer = optionalId ? new Peer(optionalId) : new Peer();
+
+    peer.on('open', id => {
+      myIdEl.innerText = id;
+      const shareURL = `${location.origin}${location.pathname}?id=${id}`;
+      shareLinkEl.href = shareURL;
+      shareLinkEl.innerText = shareURL;
+      statusEl.innerText = 'ready (id: ' + id + ')';
+      log('Peer open:', id);
+
+      // If the page was opened with ?id=someId and that id is NOT our id
+      // then we should attempt to connect to that id (this is the receiver side).
+      // If targetIdFromUrl equals our id (edge case when user clicked their own link), skip.
+      if (targetIdFromUrl && targetIdFromUrl !== id) {
+        log('Auto-connecting to target id from URL:', targetIdFromUrl);
+        connectTo(targetIdFromUrl);
       }
     });
-  });
-}
 
-function makePeerConnection() {
-  pc = new RTCPeerConnection({ iceServers });
-  pc.addEventListener('iceconnectionstatechange', () => {
-    log('ICE state:', pc.iceConnectionState);
-    document.getElementById('status').innerText = pc.iceConnectionState;
-    if (pc.iceConnectionState === 'connected') {
-      document.getElementById('status').className = 'connected';
-    }
-  });
-  pc.addEventListener('connectionstatechange', () => {
-    log('Conn state:', pc.connectionState);
-  });
-  pc.addEventListener('datachannel', (ev) => {
-    log('Incoming datachannel', ev.channel.label);
-    setupDataChannel(ev.channel);
-  });
-  return pc;
-}
+    peer.on('connection', c => {
+      log('Incoming connection from', c.peer);
+      // close existing connection if present
+      if (conn && conn.open) {
+        try { conn.close(); } catch(e) {}
+      }
+      setupConnection(c);
+    });
 
-function setupDataChannel(ch) {
-  dataChannel = ch;
-  dataChannel.onopen = () => log('[data] open');
-  dataChannel.onclose = () => log('[data] closed');
-  dataChannel.onerror = (e) => log('[data] error', e);
-  dataChannel.onmessage = (ev) => onDataMessage(ev.data);
-}
+    peer.on('error', err => {
+      log('Peer error:', err);
+      statusEl.innerText = 'peer error';
+    });
 
-// Simple protocol: if message is JSON with type:'file-chunk' we handle file reassembly
-let incomingFiles = {}; // id -> {name, size, received, chunks: []}
-function onDataMessage(data) {
-  // binary or text
-  if (typeof data === 'string') {
-    try {
-      const obj = JSON.parse(data);
-      if (obj.type === 'file-meta') {
-        incomingFiles[obj.id] = { name: obj.name, size: obj.size, received: 0, chunks: [] };
-        log('[file] incoming', obj.name, 'size', obj.size, 'id', obj.id);
-        return;
-      } else if (obj.type === 'file-complete') {
-        const f = incomingFiles[obj.id];
-        if (!f) { log('[file] unknown complete id', obj.id); return; }
-        const blob = new Blob(f.chunks);
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = f.name;
-        // auto-trigger download
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+    // convenience buttons
+    copyLinkBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(shareLinkEl.href);
+        log('Share link copied to clipboard');
+      } catch(e) {
+        alert('Copy failed — copy manually: ' + shareLinkEl.href);
+      }
+    };
 
-        log('[file] received complete', f.name);
-        delete incomingFiles[obj.id];
-        return;
-        }
-    } catch(e) {
-      // not JSON; fall through
-    }
-    log('[msg] text:', data);
-    return;
-  } else { // ArrayBuffer / Blob
-    // Try ArrayBuffer
-    const arr = data instanceof Blob ? null : data;
-    if (data instanceof Blob) {
-      data.arrayBuffer().then(buf => handleChunk(buf));
-    } else {
-      handleChunk(arr);
-    }
+    regenBtn.onclick = () => {
+      if (!confirm('Regenerate peer ID? Existing connections will be closed.')) return;
+      startPeer(); // new random id
+    };
   }
 
-  function handleChunk(buf) {
-    // Expect first bytes to contain ID length and ID? Simpler: sender will send pure binary chunk and we can't identify which file without protocol.
-    // So we send metadata messages (file-meta) before binary chunks. We'll push chunks to the last active incoming file.
-    // Find the only file in incomingFiles which is not complete
+  function connectTo(remoteId) {
+    if (!peer) return alert('Peer not ready');
+    if (remoteId === myIdEl.innerText) { log('Refusing to connect to self'); return; }
+    log('Connecting to', remoteId);
+    const c = peer.connect(remoteId, { reliable: true });
+    c.on('open', () => {
+      log('Connected to', remoteId);
+      setupConnection(c);
+    });
+    c.on('error', (e) => log('connect error', e));
+  }
+
+  // Setup DataConnection event handlers
+  function setupConnection(c) {
+    conn = c;
+    statusEl.innerText = 'connected to ' + conn.peer;
+    myIdEl.classList.add('connected');
+
+    conn.on('data', async data => {
+      // Data can be object (metadata) or ArrayBuffer/Uint8Array/Blob
+      // Check for control messages first
+      if (data && typeof data === 'object' && !(data instanceof ArrayBuffer) && !(data instanceof Uint8Array) && !(window.Blob && data instanceof Blob)) {
+        // control object
+        if (data.type === 'file-meta') {
+          const id = data.id;
+          incomingFiles[id] = { name: data.name, size: data.size, received: 0, chunks: [] };
+          // UI
+          const wrap = document.createElement('div');
+          wrap.id = 'file-' + id;
+          const title = document.createElement('div');
+          title.textContent = `Incoming: ${data.name} (${data.size} bytes)`;
+          const p = document.createElement('progress');
+          p.max = data.size;
+          p.value = 0;
+          const t = document.createElement('div');
+          t.className = 'small';
+          t.textContent = '0 / ' + data.size;
+          wrap.appendChild(title);
+          wrap.appendChild(p);
+          wrap.appendChild(t);
+          incomingList.prepend(wrap);
+          incomingFiles[id].progressEl = p;
+          incomingFiles[id].textEl = t;
+          log('[file] incoming meta', data.name, data.size, 'id', id);
+        } else if (data.type === 'file-complete') {
+          const id = data.id;
+          const f = incomingFiles[id];
+          if (!f) { log('[file] unknown complete', id); return; }
+          // assemble
+          log('[file] assembling', f.name);
+          // convert chunk list (Uint8Array) to Blob parts
+          const parts = f.chunks.map(u8 => u8.buffer ? new Uint8Array(u8).buffer : u8);
+          const blob = new Blob(parts);
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = f.name;
+          a.style.display = 'none';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          log('[file] received complete:', f.name);
+          // cleanup UI
+          const wrap = document.getElementById('file-' + id);
+          if (wrap) wrap.querySelector('.small').textContent = `Downloaded ${f.size} bytes — saved as ${f.name}`;
+          delete incomingFiles[id];
+        } else {
+          log('[data] object', data);
+        }
+        return;
+      }
+
+      // Binary chunk handling (ArrayBuffer / Uint8Array / Blob)
+      if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
+        const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+        handleBinaryChunk(u8);
+        return;
+      }
+
+      // Blob (async)
+      if (window.Blob && data instanceof Blob) {
+        const buf = await data.arrayBuffer();
+        handleBinaryChunk(new Uint8Array(buf));
+        return;
+      }
+
+      // fallback: unknown
+      log('[data] unknown type', data);
+    });
+
+    conn.on('close', () => {
+      log('[conn] closed');
+      statusEl.innerText = 'idle';
+      myIdEl.classList.remove('connected');
+      conn = null;
+    });
+
+    conn.on('error', (e) => {
+      log('[conn] error', e);
+    });
+  }
+
+  function handleBinaryChunk(u8) {
+    // place chunk into first known incoming file (same heuristic as earlier)
     const keys = Object.keys(incomingFiles);
     if (keys.length === 0) {
-      log('[file] got a binary chunk but no metadata known');
+      log('[file] got chunk but no metadata known');
       return;
     }
-    const id = keys[0]; // simple heuristic
+    const id = keys[0];
     const f = incomingFiles[id];
-    f.chunks.push(new Uint8Array(buf));
-    f.received += buf.byteLength;
-    log(`[file] chunk received (${buf.byteLength} bytes). total ${f.received}/${f.size}`);
+    f.chunks.push(u8);
+    f.received += u8.byteLength;
+    if (f.progressEl) f.progressEl.value = f.received;
+    if (f.textEl) f.textEl.textContent = `${f.received} / ${f.size}`;
+    log(`[file] chunk received (${u8.byteLength} bytes). total ${f.received}/${f.size}`);
   }
-}
 
-async function createOfferAndURL() {
-  isInitiator = true;
-  makePeerConnection();
-  // create data channel
-  const ch = pc.createDataChannel('p2p-data');
-  setupDataChannel(ch);
+  // --- Sending files ---
+  sendBtn.addEventListener('click', async () => {
+    if (!conn || conn.open === false) return alert('Not connected');
+    const files = fileInput.files;
+    if (!files || files.length === 0) return alert('Select a file first');
+    const file = files[0];
+    await sendFile(file);
+  });
 
-  log('Creating offer...');
-  const offer = await pc.createOffer({ offerToReceiveAudio:false, offerToReceiveVideo:false });
-  await pc.setLocalDescription(offer);
-
-  // wait for ICE gather complete
-  log('Waiting for ICE gathering to complete...');
-  await waitForIceGatheringComplete(pc);
-  log('ICE gather complete.');
-
-  // Now localDescription contains ICE candidates
-  const sdp = pc.localDescription.sdp;
-  const payload = utoa(JSON.stringify({ type: 'offer', sdp }));
-  const url = setParamInURL('offer', payload);
-  document.getElementById('offerURL').value = url;
-  log('Offer URL ready. Share it with remote.');
-}
-
-async function processIncomingOffer(base64) {
-  try {
-    const decoded = JSON.parse(atou(base64));
-    if (decoded.type !== 'offer') throw new Error('Not an offer');
-    makePeerConnection();
-
-    // Create answer path: set remote desc and create answer
-    log('Setting remote description (offer)...');
-    await pc.setRemoteDescription({ type: 'offer', sdp: decoded.sdp });
-
-    log('Creating answer...');
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    log('Waiting for ICE gather complete (answer side)...');
-    await waitForIceGatheringComplete(pc);
-    log('ICE gather complete (answer).');
-
-    // Build answer URL to send back
-    const payload = utoa(JSON.stringify({ type:'answer', sdp: pc.localDescription.sdp }));
-    const url = setParamInURL('answer', payload);
-    document.getElementById('answerURL').value = url;
-    log('Answer URL created. Copy it back to originator.');
-  } catch (e) {
-    log('Error processing offer:', e);
-  }
-}
-
-async function applyAnswerFromBase64(base64) {
-  try {
-    const decoded = JSON.parse(atou(base64));
-    if (decoded.type !== 'answer') throw new Error('Not an answer');
-    if (!pc) {
-      log('No RTCPeerConnection exists. Creating one (caller)...');
-      makePeerConnection();
+  // drag & drop to fileInput
+  document.body.addEventListener('dragover', e => { e.preventDefault(); });
+  document.body.addEventListener('drop', e => {
+    e.preventDefault();
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      fileInput.files = e.dataTransfer.files;
+      log('File selected via drop:', fileInput.files[0].name);
     }
-    log('Applying remote answer...');
-    await pc.setRemoteDescription({ type: 'answer', sdp: decoded.sdp });
-    log('Remote answer applied. Waiting for connection...');
-  } catch (e) {
-    log('Error applying answer:', e);
+  });
+
+  async function sendFile(file) {
+    if (!conn || conn.open === false) { alert('Not connected'); return; }
+    const id = Math.random().toString(36).slice(2);
+    // send metadata first
+    conn.send({ type: 'file-meta', id, name: file.name, size: file.size });
+    log('[file] sending meta', file.name, file.size, 'id', id);
+
+    // prepare progress UI
+    sendProgressWrap.style.display = 'block';
+    sendProgress.max = file.size;
+    sendProgress.value = 0;
+    sendProgressText.textContent = `0 / ${file.size}`;
+
+    // stream file by slicing (broad browser compatibility)
+    const total = file.size;
+    let offset = 0;
+    while (offset < total) {
+      const chunk = file.slice(offset, offset + CHUNK_SIZE);
+      // read as ArrayBuffer
+      const buf = await chunk.arrayBuffer();
+      // send the ArrayBuffer
+      try {
+        conn.send(buf);
+      } catch (e) {
+        log('[file] send error', e);
+        // try reconnect? For now abort
+        alert('Send failed: ' + e);
+        sendProgressText.textContent = 'Send failed';
+        return;
+      }
+      offset += buf.byteLength;
+      sendProgress.value = offset;
+      sendProgressText.textContent = `${offset} / ${total}`;
+      // simple backpressure: if connection's bufferedAmount is large, wait a tick
+      // PeerJS DataConnection proxies RTCDataChannel underneath; it may expose bufferedAmount on conn._dc
+      // We'll check both common locations if present.
+      await maybeWaitForBuffer();
+    }
+
+    // finished -> tell receiver to assemble
+    conn.send({ type: 'file-complete', id });
+    log('[file] send complete', file.name);
+
+    // hide progress after a short delay
+    setTimeout(() => { sendProgressWrap.style.display = 'none'; sendProgress.value = 0; sendProgressText.textContent = ''; }, 1200);
   }
-}
 
-// UI wiring
-document.getElementById('makeOffer').addEventListener('click', async () => {
-  document.getElementById('offerURL').value = '';
-  await createOfferAndURL();
-});
-
-document.getElementById('applyAnswer').addEventListener('click', async () => {
-  const pasted = document.getElementById('pasteAnswer').value.trim();
-  if (!pasted) { alert('Paste the answer URL (the full URL with ?answer=...)'); return; }
-  // extract answer param from pasted URL
-  try {
-    const u = new URL(pasted);
-    const ans = u.searchParams.get('answer');
-    if (!ans) { alert('No answer param found in the pasted URL'); return; }
-    await applyAnswerFromBase64(ans);
-  } catch (e) {
-    alert('Invalid URL');
+  // try to detect and wait for bufferedAmount to drop
+  function maybeWaitForBuffer() {
+    return new Promise(resolve => {
+      try {
+        const dc = conn && (conn._dc || conn._dataChannel || conn._channel || conn.peerConnection && conn.peerConnection._dataChannels && conn.peerConnection._dataChannels[0]);
+        // fallback threshold in bytes
+        const THRESH = 256 * 1024; // 256KB
+        if (!dc || typeof dc.bufferedAmount === 'undefined') {
+          // unknown underlying DC: just wait a tiny bit to avoid overwhelming
+          return setTimeout(resolve, 8);
+        }
+        if (dc.bufferedAmount <= THRESH) return resolve();
+        // wait for bufferedAmountLow event if present
+        const onLow = () => {
+          try { dc.removeEventListener && dc.removeEventListener('bufferedamountlow', onLow); } catch(e){}
+          resolve();
+        };
+        if (dc.addEventListener) {
+          try {
+            dc.addEventListener('bufferedamountlow', onLow, { once: true });
+            // ensure we set the threshold if supported
+            if (typeof dc.bufferedAmountLowThreshold !== 'undefined') {
+              dc.bufferedAmountLowThreshold = THRESH;
+            }
+            // but also use timeout fallback
+            setTimeout(resolve, 2000);
+          } catch (e) {
+            setTimeout(resolve, 50);
+          }
+        } else {
+          setTimeout(resolve, 50);
+        }
+      } catch (e) {
+        setTimeout(resolve, 20);
+      }
+    });
   }
-});
 
-document.getElementById('applyPasteAnswer').addEventListener('click', async () => {
-  const pasted = document.getElementById('pasteAnswer').value.trim();
-  if (!pasted) { alert('Paste the answer URL (the full URL with ?answer=...)'); return; }
-  try {
-    const u = new URL(pasted);
-    const ans = u.searchParams.get('answer');
-    if (!ans) { alert('No answer param found'); return; }
-    await applyAnswerFromBase64(ans);
-  } catch (e) {
-    alert('Invalid URL');
-  }
-});
-
-document.getElementById('sendMsg').addEventListener('click', () => {
-  const txt = document.getElementById('messageInput').value;
-  if (!dataChannel || dataChannel.readyState !== 'open') return alert('Data channel not open');
-  dataChannel.send(txt);
-  log('[you] ' + txt);
-  document.getElementById('messageInput').value = '';
-});
-
-// Simple file send: metadata JSON then binary chunks (64KB)
-document.getElementById('sendFile').addEventListener('click', async () => {
-  const fi = document.getElementById('fileInput');
-  if (!fi.files || fi.files.length === 0) return alert('Select a file first');
-  if (!dataChannel || dataChannel.readyState !== 'open') return alert('Data channel not open');
-  const file = fi.files[0];
-  const id = Math.random().toString(36).slice(2);
-  // send metadata
-  dataChannel.send(JSON.stringify({ type:'file-meta', id, name:file.name, size:file.size }));
-  const chunkSize = 64*1024; // 64KB
-  const stream = file.stream();
-  const reader = stream.getReader();
-  let sent = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    // value is Uint8Array chunk
-    dataChannel.send(value);
-    sent += value.byteLength;
-    log(`[file] sent chunk ${sent}/${file.size}`);
-  }
-  dataChannel.send(JSON.stringify({ type:'file-complete', id }));
-  log('[file] send complete');
-});
-
-
-// When loaded, auto-check URL params
-(async function autoProcessURL() {
-  const offerParam = getParam('offer');
-  const answerParam = getParam('answer');
-
-  if (offerParam && !answerParam) {
-    // remote gave us an offer; create answer and show answer URL
-    log('Found offer param in URL — creating answer.');
-    await processIncomingOffer(offerParam);
-  } else if (answerParam && !offerParam) {
-    // originator: they got an answer back (maybe pasted link) — but typically they will paste.
-    // If user opened originator page with ?answer=..., apply it automatically.
-    log('Found answer param in URL — applying answer.');
-    await applyAnswerFromBase64(answerParam);
-  } else if (offerParam && answerParam) {
-    // Both present — try applying answer if we already created local offer
-    log('Found both offer and answer in URL. Attempt to apply answer.');
-    await processIncomingOffer(offerParam); // will make PC and put answerURL field, but we already have answer; so try apply
-    await applyAnswerFromBase64(answerParam);
-  } else {
-    log('No offer/answer params in URL. Create an offer to start.');
-  }
-})();
-
-</script>
+  // --- start ---
+  startPeer(); // create random id on load
+  </script>
 </body>
 </html>
